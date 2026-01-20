@@ -5,7 +5,7 @@ import gzip
 import ipaddress
 from datetime import datetime
 from django.conf import settings
-from .storage import get_exemption_store
+from .storage import get_exemption_store, get_path_exemption_store
 
 _LOG_RX = re.compile(
     r'(\d+\.\d+\.\d+\.\d+).*\[(.*?)\].*"(GET|POST) (.*?) HTTP/.*?" (\d{3}).*?"(.*?)" "(.*?)"'
@@ -115,10 +115,15 @@ def is_exempt_path(path):
         if path.startswith(exempt_path):
             return True
         
-    # Check configured exempt paths
-    exempt_paths = getattr(settings, "AIWAF_EXEMPT_PATHS", [])
+    # Check configured exempt paths (settings + database)
+    exempt_paths = get_exempt_paths()
     for exempt_path in exempt_paths:
-        if path == exempt_path or path.startswith(exempt_path.rstrip("/") + "/"):
+        prefix = exempt_path.rstrip("/")
+        if not prefix:
+            if path == "/":
+                return True
+            continue
+        if path == exempt_path or path == prefix or path.startswith(prefix + "/"):
             return True
     
     return False
@@ -126,3 +131,97 @@ def is_exempt_path(path):
 def is_exempt(request):
     """Check if request should be exempt (either by path or view decorator)"""
     return is_exempt_path(request.path) or is_view_exempt(request)
+
+
+def get_exempt_paths():
+    """Return all exempt paths from settings and database."""
+    paths = []
+    settings_paths = getattr(settings, "AIWAF_EXEMPT_PATHS", [])
+    if settings_paths:
+        paths.extend(settings_paths)
+    store = get_path_exemption_store()
+    db_paths = store.get_all_exempted_paths()
+    if db_paths:
+        paths.extend(db_paths)
+    normalized = []
+    for path in paths:
+        if not path:
+            continue
+        cleaned = re.sub(r"/{2,}", "/", str(path).strip())
+        if not cleaned.startswith("/"):
+            cleaned = "/" + cleaned
+        normalized.append(cleaned.lower())
+    return normalized
+
+
+def get_path_rule_for_path(path):
+    """Return the most specific PATH_RULES entry matching the path."""
+    if not path:
+        return None
+    rules = []
+    settings_block = getattr(settings, "AIWAF_SETTINGS", {}) or {}
+    for rule in settings_block.get("PATH_RULES", []) or []:
+        if not isinstance(rule, dict):
+            continue
+        prefix = _normalize_rule_prefix(rule.get("PREFIX"))
+        if not prefix:
+            continue
+        rules.append((prefix, rule))
+    if not rules:
+        return None
+    path = _normalize_rule_prefix(path, trailing_slash=False)
+    best = None
+    for prefix, rule in rules:
+        if path == prefix.rstrip("/") or path.startswith(prefix):
+            if best is None or len(prefix) > len(best[0]):
+                best = (prefix, rule)
+    return best[1] if best else None
+
+
+def is_middleware_disabled(request, middleware_name):
+    """Check if middleware is disabled by PATH_RULES for this request."""
+    rule = get_path_rule_for_path(getattr(request, "path", ""))
+    if not rule:
+        return False
+    disabled = rule.get("DISABLE", []) or []
+    if not isinstance(disabled, (list, tuple, set)):
+        return False
+    target = _normalize_middleware_name(middleware_name)
+    for entry in disabled:
+        entry_norm = _normalize_middleware_name(entry)
+        if entry_norm == target:
+            return True
+    return False
+
+
+def get_rate_limit_overrides(request):
+    """Return rate limit overrides from PATH_RULES for this request."""
+    rule = get_path_rule_for_path(getattr(request, "path", ""))
+    if not rule:
+        return {}
+    overrides = rule.get("RATE_LIMIT", {}) or {}
+    if not isinstance(overrides, dict):
+        return {}
+    return overrides
+
+
+def _normalize_rule_prefix(prefix, trailing_slash=True):
+    if not prefix:
+        return None
+    cleaned = re.sub(r"/{2,}", "/", str(prefix).strip())
+    if not cleaned.startswith("/"):
+        cleaned = "/" + cleaned
+    if trailing_slash and not cleaned.endswith("/"):
+        cleaned += "/"
+    return cleaned.lower()
+
+
+def _normalize_middleware_name(name):
+    if not name:
+        return ""
+    if not isinstance(name, str):
+        name = getattr(name, "__name__", str(name))
+    name = name.strip()
+    if "." in name:
+        name = name.split(".")[-1]
+    return name.lower()
