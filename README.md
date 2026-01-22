@@ -408,6 +408,9 @@ Enable AI-WAF's built-in request logger as a fallback when main access logs aren
 ```python
 # Enable middleware logging
 AIWAF_MIDDLEWARE_LOGGING = True                    # Enable/disable logging
+AIWAF_MIDDLEWARE_LOG = "aiwaf_requests.log"        # Optional log file name
+AIWAF_MIDDLEWARE_CSV = True                        # Write CSV log file (default: True)
+AIWAF_MIDDLEWARE_DB = True                         # Write RequestLog entries (default: True)
 ```
 
 **Then add middleware to MIDDLEWARE list:**
@@ -429,9 +432,11 @@ python manage.py aiwaf_logging --clear     # Clear log files
 
 **Benefits:**
 - **Automatic fallback** when `AIWAF_ACCESS_LOG` unavailable
-- **Database storage** with precise timestamps and response times
+- **CSV or database storage** with precise timestamps and response times
 - **Zero configuration** - trainer automatically detects and uses model logs
 - **Lightweight** - fails silently to avoid breaking your application
+
+If you want the trainer to use the CSV log file, point `AIWAF_ACCESS_LOG` at the CSV path (e.g., `aiwaf_requests.csv`).
 
 ---
 
@@ -588,6 +593,10 @@ MIDDLEWARE = [
 ```
 
 > **⚠️ Order matters!** AI-WAF protection middleware should come early. The logger middleware should come near the end to capture final response data.
+
+**UUIDTamperMiddleware behavior:**
+- Only checks models in the view's app that have UUID primary keys or unique UUID fields.
+- If an app has no such models, the middleware is a no-op for that request.
 
 ### **Troubleshooting Middleware Errors**
 
@@ -770,7 +779,7 @@ python manage.py aiwaf_reset --blacklist --confirm
 | RateLimitMiddleware                | Enforces burst & flood thresholds                               |
 | AIAnomalyMiddleware                | ML‑driven behavior analysis + block on anomaly                  |
 | HoneypotTimingMiddleware           | Enhanced bot detection: GET→POST timing, POST validation, page timeouts |
-| UUIDTamperMiddleware               | Blocks guessed/nonexistent UUIDs across all models in an app    |
+| UUIDTamperMiddleware               | Blocks guessed/nonexistent UUIDs across models with UUID PKs or unique UUID fields in an app (no-op if none) |
 | HeaderValidationMiddleware         | Blocks suspicious header patterns and low‑quality user agents   |
 | AIWAFLoggerMiddleware              | Optional request logger for model training and analysis         |
 
