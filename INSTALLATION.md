@@ -252,6 +252,22 @@ your_project/
 - `aiwaf_requestlog` - Request logs (if middleware logging enabled)
 ```
 
+## Optional Rust Backend (CSV + Header Validation)
+
+When `AIWAF_USE_RUST = True`, AI-WAF uses a Rust
+backend (pyo3/maturin) for header validation. If the Rust module is not
+available, it falls back to Python automatically.
+
+```bash
+pip install maturin
+maturin develop -m Cargo.toml
+```
+
+```python
+AIWAF_MIDDLEWARE_CSV = True
+AIWAF_USE_RUST = True
+```
+
 ## Verification Checklist
 
 - [ ] `aiwaf` added to `INSTALLED_APPS`

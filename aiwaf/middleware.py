@@ -10,6 +10,7 @@ import logging
 from datetime import datetime, timedelta
 from collections import defaultdict
 from django.utils.deprecation import MiddlewareMixin
+from django.utils import timezone
 from django.http import JsonResponse
 from django.core.exceptions import PermissionDenied
 from django.conf import settings
@@ -50,6 +51,11 @@ from .utils import (
 from .storage import get_keyword_store
 from .settings_compat import apply_legacy_settings
 from .model_store import load_model_data, _normalize_storage_mode
+from .rust_backend import (
+    rust_available,
+    validate_headers as rust_validate_headers,
+    analyze_recent_behavior as rust_analyze_recent_behavior,
+)
 
 apply_legacy_settings()
 
@@ -140,25 +146,24 @@ def _describe_model_lookup():
 
 def load_model_safely():
     """Load the AI model with version compatibility checking."""
-    import warnings
-    
+
     # Check if AI is disabled globally
     ai_disabled = getattr(settings, "AIWAF_DISABLE_AI", False)
     if ai_disabled:
-        print("ℹ️  AI functionality disabled via AIWAF_DISABLE_AI setting")
+        logger.info("AI functionality disabled via AIWAF_DISABLE_AI setting")
         return None
-    
+
     # Check if required dependencies are available
     if not JOBLIB_AVAILABLE:
-        print("ℹ️  joblib not available, AI functionality disabled")
+        logger.info("joblib not available, AI functionality disabled")
         return None
-    
+
     try:
         import sklearn
     except ImportError:
-        print("ℹ️  sklearn not available, AI functionality disabled")
+        logger.info("sklearn not available, AI functionality disabled")
         return None
-    
+
     try:
         # Suppress sklearn version warnings temporarily
         with warnings.catch_warnings():
@@ -166,29 +171,33 @@ def load_model_safely():
             model_data = load_model_data()
             if model_data is None:
                 raise ValueError("no model data available")
-            
+
             # Handle both old format (direct model) and new format (with metadata)
-            if isinstance(model_data, dict) and 'model' in model_data:
+            if isinstance(model_data, dict) and "model" in model_data:
                 # New format with metadata
-                model = model_data['model']
-                stored_version = model_data.get('sklearn_version', 'unknown')
+                model = model_data["model"]
+                stored_version = model_data.get("sklearn_version", "unknown")
                 current_version = sklearn.__version__
-                
+
                 if stored_version != current_version:
-                    print(f"ℹ️  Model was trained with sklearn v{stored_version}, current v{current_version}")
-                    print("   Run 'python manage.py detect_and_train' to update model if needed.")
-                
+                    logger.warning(
+                        "Model was trained with sklearn v%s, current v%s",
+                        stored_version,
+                        current_version,
+                    )
+                    logger.info("Run 'python manage.py detect_and_train' to update the model if needed.")
+
                 return model
             else:
                 # Old format - direct model object
-                print("ℹ️  Using legacy model format. Consider retraining for better compatibility.")
+                logger.info("Using legacy model format. Consider retraining for better compatibility.")
                 return model_data
-                
+
     except Exception as e:
         lookup = _describe_model_lookup()
-        print(f"Warning: Could not load AI model from {lookup}: {e}")
-        print("AI anomaly detection will be disabled until model is retrained.")
-        print("Run 'python manage.py detect_and_train' to regenerate the model.")
+        logger.warning("Could not load AI model from %s: %s", lookup, e)
+        logger.info("AI anomaly detection will remain disabled until a model is retrained.")
+        logger.info("Run 'python manage.py detect_and_train' to regenerate the model.")
         return None
 
 # Load model with safety checks
@@ -208,6 +217,72 @@ def get_ip(request):
     if xff:
         return xff.split(",")[0].strip()
     return request.META.get("REMOTE_ADDR", "")
+
+
+def _normalize_header_name(meta_key):
+    if meta_key.startswith("HTTP_"):
+        return meta_key[5:].replace("_", "-").title()
+    if meta_key in {"CONTENT_TYPE", "CONTENT_LENGTH"}:
+        return meta_key.replace("_", "-").title()
+    return None
+
+
+def _collect_request_headers(request):
+    max_headers = getattr(settings, "AIWAF_BLACKLIST_MAX_HEADERS", 50)
+    max_value_len = getattr(settings, "AIWAF_BLACKLIST_MAX_HEADER_VALUE_LENGTH", 512)
+    redact = {
+        h.lower()
+        for h in getattr(
+            settings,
+            "AIWAF_BLACKLIST_REDACT_HEADERS",
+            ["Authorization", "Cookie", "Set-Cookie"],
+        )
+    }
+    headers = {}
+    for key, value in request.META.items():
+        name = _normalize_header_name(key)
+        if not name:
+            continue
+        if len(headers) >= max_headers:
+            break
+        value = str(value)
+        if name.lower() in redact:
+            headers[name] = "[redacted]"
+            continue
+        if max_value_len and len(value) > max_value_len:
+            value = value[:max_value_len] + "...(truncated)"
+        headers[name] = value
+    return headers
+
+
+def _get_blacklist_extended_info(request):
+    if not getattr(settings, "AIWAF_BLACKLIST_STORE_EXTENDED_INFO", False):
+        return None
+
+    cache_attr = "_aiwaf_blacklist_extended_info"
+    cached = getattr(request, cache_attr, None)
+    if cached is not None:
+        return cached
+
+    info = {
+        "method": getattr(request, "method", ""),
+        "path": getattr(request, "path", ""),
+    }
+    query_string = request.META.get("QUERY_STRING")
+    if query_string:
+        info["query_string"] = query_string
+    try:
+        info["url"] = request.build_absolute_uri()
+    except Exception:
+        info["url"] = info["path"]
+    try:
+        info["host"] = request.get_host()
+    except Exception:
+        pass
+    info["headers"] = _collect_request_headers(request)
+
+    setattr(request, cache_attr, info)
+    return info
 
 class IPAndKeywordBlockMiddleware:
     def __init__(self, get_response):
@@ -519,7 +594,11 @@ class IPAndKeywordBlockMiddleware:
                 if self._is_malicious_context(request, seg) or not path_exists:
                     # Double-check exemption before blocking
                     if not is_ip_exempted(ip):
-                        BlacklistManager.block(ip, f"Keyword block: {block_reason}")
+                        BlacklistManager.block(
+                            ip,
+                            f"Keyword block: {block_reason}",
+                            extended_request_info=_get_blacklist_extended_info(request),
+                        )
                         # Check again after blocking attempt (exempted IPs won't be blocked)
                         if BlacklistManager.is_blocked(ip):
                             _raise_blocked(request, f"Keyword block: {block_reason}", status_code=403)
@@ -562,7 +641,11 @@ class RateLimitMiddleware:
         if len(timestamps) > flood:
             # Double-check exemption before blocking
             if not is_ip_exempted(ip):
-                BlacklistManager.block(ip, "Flood pattern")
+                BlacklistManager.block(
+                    ip,
+                    "Flood pattern",
+                    extended_request_info=_get_blacklist_extended_info(request),
+                )
                 # Check if actually blocked (exempted IPs won't be blocked)
                 if BlacklistManager.is_blocked(ip):
                     _raise_blocked(request, "Flood pattern", status_code=403)
@@ -620,7 +703,11 @@ class GeoBlockMiddleware(MiddlewareMixin):
             should_block = country in (self.block_countries + dynamic_block)
 
         if should_block:
-            BlacklistManager.block(ip, f"Geo-blocked country: {country}")
+            BlacklistManager.block(
+                ip,
+                f"Geo-blocked country: {country}",
+                extended_request_info=_get_blacklist_extended_info(request),
+            )
             if BlacklistManager.is_blocked(ip):
                 _raise_blocked(request, f"Geo-blocked country: {country}", status_code=403)
         return None
@@ -682,7 +769,7 @@ class AIAnomalyMiddleware(MiddlewareMixin):
 
         try:
             from .models import RequestLog
-            cutoff_date = datetime.now() - timedelta(days=30)
+            cutoff_date = timezone.now() - timedelta(days=30)
             db_count = RequestLog.objects.filter(timestamp__gte=cutoff_date).count()
             count = max(count, db_count)
         except Exception as exc:
@@ -768,6 +855,79 @@ class AIAnomalyMiddleware(MiddlewareMixin):
             
         return False
 
+    def _analyze_recent_behavior_python(self, recent_data):
+        recent_kw_hits = []
+        recent_404s = 0
+        recent_burst_counts = []
+
+        for entry_time, entry_path, entry_status, _ in recent_data:
+            entry_known_path = path_exists_in_django(entry_path)
+            entry_kw_hits = 0
+            if not entry_known_path and not is_exempt_path(entry_path):
+                entry_kw_hits = sum(1 for kw in STATIC_KW if kw in entry_path.lower())
+            recent_kw_hits.append(entry_kw_hits)
+
+            if entry_status == 404:
+                recent_404s += 1
+
+            entry_burst = sum(1 for (t, _, _, _) in recent_data if abs(entry_time - t) <= 10)
+            recent_burst_counts.append(entry_burst)
+
+        avg_kw_hits = sum(recent_kw_hits) / len(recent_kw_hits) if recent_kw_hits else 0
+        max_404s = recent_404s
+        avg_burst = sum(recent_burst_counts) / len(recent_burst_counts) if recent_burst_counts else 0
+        total_requests = len(recent_data)
+        scanning_404s = sum(
+            1 for (_, path, status, _) in recent_data if status == 404 and self._is_scanning_path(path)
+        )
+        legitimate_404s = max_404s - scanning_404s
+
+        should_block = True
+        if max_404s == 0 and avg_kw_hits == 0 and scanning_404s == 0:
+            should_block = False
+        elif (
+            avg_kw_hits < 3
+            and scanning_404s < 5
+            and legitimate_404s < 20
+            and avg_burst < 25
+            and total_requests < 150
+        ):
+            should_block = False
+
+        return {
+            "avg_kw_hits": avg_kw_hits,
+            "max_404s": max_404s,
+            "avg_burst": avg_burst,
+            "total_requests": total_requests,
+            "scanning_404s": scanning_404s,
+            "legitimate_404s": legitimate_404s,
+            "should_block": should_block,
+        }
+
+    def _analyze_recent_behavior(self, recent_data):
+        if not recent_data:
+            return None
+
+        stats = None
+        if getattr(settings, "AIWAF_USE_RUST", False) and rust_available():
+            rust_payload = []
+            for entry_time, entry_path, entry_status, _ in recent_data:
+                entry_known_path = path_exists_in_django(entry_path)
+                rust_payload.append({
+                    "path_lower": entry_path.lower(),
+                    "timestamp": entry_time,
+                    "status": int(entry_status),
+                    "kw_check": (not entry_known_path and not is_exempt_path(entry_path)),
+                })
+            rust_stats = rust_analyze_recent_behavior(rust_payload, STATIC_KW)
+            if rust_stats:
+                stats = rust_stats
+
+        if stats is None:
+            stats = self._analyze_recent_behavior_python(recent_data)
+
+        return stats
+
     def process_request(self, request):
         if is_middleware_disabled(request, self.__class__):
             return None
@@ -827,59 +987,20 @@ class AIAnomalyMiddleware(MiddlewareMixin):
                 
                 # Get recent behavior data for this IP to make intelligent blocking decision
                 recent_data = [d for d in data if now - d[0] <= 300]  # Last 5 minutes
-                
-                # Always initialize variables before use
-                recent_kw_hits = []
-                recent_404s = 0
-                recent_burst_counts = []
-                
-                if recent_data:
-                    for entry_time, entry_path, entry_status, entry_resp_time in recent_data:
-                        # Calculate keyword hits for this entry
-                        entry_known_path = path_exists_in_django(entry_path)
-                        entry_kw_hits = 0
-                        if not entry_known_path and not is_exempt_path(entry_path):
-                            entry_kw_hits = sum(1 for kw in STATIC_KW if kw in entry_path.lower())
-                        recent_kw_hits.append(entry_kw_hits)
-                        
-                        # Count 404s
-                        if entry_status == 404:
-                            recent_404s += 1
-                        
-                        # Calculate burst for this entry (requests within 10 seconds)
-                        entry_burst = sum(1 for (t, _, _, _) in recent_data if abs(entry_time - t) <= 10)
-                        recent_burst_counts.append(entry_burst)
-                
-                # Calculate averages and maximums
-                avg_kw_hits = sum(recent_kw_hits) / len(recent_kw_hits) if recent_kw_hits else 0
-                max_404s = recent_404s
-                avg_burst = sum(recent_burst_counts) / len(recent_burst_counts) if recent_burst_counts else 0
-                total_requests = len(recent_data)
-                
-                # Enhanced 404 analysis - focus on scanning patterns
-                scanning_404s = sum(1 for (_, path, status, _) in recent_data 
-                                  if status == 404 and self._is_scanning_path(path))
-                legitimate_404s = max_404s - scanning_404s
-                
-                # Don't block if it looks like legitimate behavior:
-                # 1) Pure burst traffic with no 404s/keywords (e.g., polling)
-                # 2) Mostly clean traffic within relaxed thresholds
-                should_block = True
-                if max_404s == 0 and avg_kw_hits == 0 and scanning_404s == 0:
-                    should_block = False
-                elif (
-                    avg_kw_hits < 3 and           # Allow some keyword hits (increased from 2)
-                    scanning_404s < 5 and        # Focus on scanning 404s, not all 404s  
-                    legitimate_404s < 20 and     # Allow more legitimate 404s (typos, old links)
-                    avg_burst < 25 and           # Allow higher burst (increased from 15)
-                    total_requests < 150         # Allow more total requests (increased from 100)
-                ):
-                    should_block = False
+                stats = self._analyze_recent_behavior(recent_data)
 
-                if should_block:
+                if stats and stats.get("should_block"):
+                    max_404s = stats.get("max_404s", 0)
+                    scanning_404s = stats.get("scanning_404s", 0)
+                    avg_kw_hits = stats.get("avg_kw_hits", 0)
+                    avg_burst = stats.get("avg_burst", 0)
                     # Double-check exemption before blocking
                     if not is_ip_exempted(ip):
-                        BlacklistManager.block(ip, f"AI anomaly + scanning 404s (total:{max_404s}, scanning:{scanning_404s}, kw:{avg_kw_hits:.1f}, burst:{avg_burst:.1f})")
+                        BlacklistManager.block(
+                            ip,
+                            f"AI anomaly + scanning 404s (total:{max_404s}, scanning:{scanning_404s}, kw:{avg_kw_hits:.1f}, burst:{avg_burst:.1f})",
+                            extended_request_info=_get_blacklist_extended_info(request),
+                        )
                         # Check if actually blocked (exempted IPs won't be blocked)
                         if BlacklistManager.is_blocked(ip):
                             _raise_blocked(
@@ -895,7 +1016,11 @@ class AIAnomalyMiddleware(MiddlewareMixin):
                 if kw_hits >= 3 and current_scanning:  # Require both high keywords AND scanning pattern
                     # Double-check exemption before blocking
                     if not is_ip_exempted(ip):
-                        BlacklistManager.block(ip, f"AI anomaly + scanning behavior (kw:{kw_hits}, scanning_path:{request.path})")
+                        BlacklistManager.block(
+                            ip,
+                            f"AI anomaly + scanning behavior (kw:{kw_hits}, scanning_path:{request.path})",
+                            extended_request_info=_get_blacklist_extended_info(request),
+                        )
                         if BlacklistManager.is_blocked(ip):
                             _raise_blocked(
                                 request,
@@ -929,6 +1054,25 @@ class AIAnomalyMiddleware(MiddlewareMixin):
 class HoneypotTimingMiddleware(MiddlewareMixin):
     MIN_FORM_TIME = getattr(settings, "AIWAF_MIN_FORM_TIME", 1.0)  # seconds
     MAX_PAGE_TIME = getattr(settings, "AIWAF_MAX_PAGE_TIME", 240)  # 4 minutes default
+
+    def _is_authenticated_session(self, request):
+        """Best effort check that this request belongs to an authenticated session."""
+        user = getattr(request, "user", None)
+        if user is not None:
+            is_authenticated = getattr(user, "is_authenticated", False)
+            # Django's AnonymousUser.is_authenticated is a property returning False, but guard callable.
+            if callable(is_authenticated):
+                is_authenticated = is_authenticated()
+            if is_authenticated:
+                return True
+
+        session = getattr(request, "session", None)
+        if session is not None:
+            session_key = getattr(session, "session_key", None)
+            if session_key and bool(session.get("_auth_user_id")):
+                return True
+
+        return False
     
     def _view_accepts_method(self, request, method):
         """
@@ -1001,6 +1145,10 @@ class HoneypotTimingMiddleware(MiddlewareMixin):
         # Additional IP-level exemption check
         if is_ip_exempted(ip):
             return None
+
+        # Authenticated sessions already proved they loaded the form legitimately; skip timing checks
+        if self._is_authenticated_session(request):
+            return None
             
         if request.method == "GET":
             # CONSERVATIVE: Only block GET if we're absolutely certain it's POST-only
@@ -1015,7 +1163,11 @@ class HoneypotTimingMiddleware(MiddlewareMixin):
                 if obvious_post_only:
                     # This is very likely a POST-only endpoint getting a GET
                     if not is_ip_exempted(ip):
-                        BlacklistManager.block(ip, f"GET to obvious POST-only endpoint: {request.path}")
+                        BlacklistManager.block(
+                            ip,
+                            f"GET to obvious POST-only endpoint: {request.path}",
+                            extended_request_info=_get_blacklist_extended_info(request),
+                        )
                         if BlacklistManager.is_blocked(ip):
                             _log_block(request, f"GET to obvious POST-only endpoint: {request.path}", status_code=405)
                             return JsonResponse({
@@ -1033,7 +1185,11 @@ class HoneypotTimingMiddleware(MiddlewareMixin):
             if not self._view_accepts_method(request, 'POST'):
                 # This view is GET-only, but received a POST - likely malicious
                 if not is_ip_exempted(ip):
-                    BlacklistManager.block(ip, f"POST to GET-only view: {request.path}")
+                    BlacklistManager.block(
+                        ip,
+                        f"POST to GET-only view: {request.path}",
+                        extended_request_info=_get_blacklist_extended_info(request),
+                    )
                     if BlacklistManager.is_blocked(ip):
                         _log_block(request, f"POST to GET-only view: {request.path}", status_code=405)
                         return JsonResponse({
@@ -1069,7 +1225,11 @@ class HoneypotTimingMiddleware(MiddlewareMixin):
                 if time_diff < min_time:
                     # Double-check exemption before blocking
                     if not is_ip_exempted(ip):
-                        BlacklistManager.block(ip, f"Form submitted too quickly ({time_diff:.2f}s)")
+                        BlacklistManager.block(
+                            ip,
+                            f"Form submitted too quickly ({time_diff:.2f}s)",
+                            extended_request_info=_get_blacklist_extended_info(request),
+                        )
                         # Check if actually blocked (exempted IPs won't be blocked)
                         if BlacklistManager.is_blocked(ip):
                             _raise_blocked(request, f"Form submitted too quickly ({time_diff:.2f}s)", status_code=403)
@@ -1080,7 +1240,11 @@ class HoneypotTimingMiddleware(MiddlewareMixin):
                 # Check if this view supports the requested method
                 if not self._view_accepts_method(request, request.method):
                     if not is_ip_exempted(ip):
-                        BlacklistManager.block(ip, f"{request.method} to view that doesn't support it: {request.path}")
+                        BlacklistManager.block(
+                            ip,
+                            f"{request.method} to view that doesn't support it: {request.path}",
+                            extended_request_info=_get_blacklist_extended_info(request),
+                        )
                         if BlacklistManager.is_blocked(ip):
                             _log_block(
                                 request,
@@ -1129,7 +1293,11 @@ class UUIDTamperMiddleware(MiddlewareMixin):
 
         # Double-check exemption before blocking
         if not is_ip_exempted(ip):
-            BlacklistManager.block(ip, "UUID tampering")
+            BlacklistManager.block(
+                ip,
+                "UUID tampering",
+                extended_request_info=_get_blacklist_extended_info(request),
+            )
             # Check if actually blocked (exempted IPs won't be blocked)
             if BlacklistManager.is_blocked(ip):
                 _raise_blocked(request, "UUID tampering", status_code=403)
@@ -1139,6 +1307,12 @@ class HeaderValidationMiddleware(MiddlewareMixin):
     """
     Validates HTTP headers to detect bots and malicious requests
     """
+    def __init__(self, get_response):
+        super().__init__(get_response)
+        self.MAX_HEADER_BYTES = getattr(settings, "AIWAF_MAX_HEADER_BYTES", 32 * 1024)
+        self.MAX_HEADER_COUNT = getattr(settings, "AIWAF_MAX_HEADER_COUNT", 100)
+        self.MAX_USER_AGENT_LENGTH = getattr(settings, "AIWAF_MAX_USER_AGENT_LENGTH", 500)
+        self.MAX_ACCEPT_LENGTH = getattr(settings, "AIWAF_MAX_ACCEPT_LENGTH", 4096)
     
     # Standard browser headers that legitimate requests should have
     REQUIRED_HEADERS = [
@@ -1178,7 +1352,7 @@ class HeaderValidationMiddleware(MiddlewareMixin):
         r'insomnia',
         r'^$',  # Empty user agent
         r'mozilla/4\.0$',  # Fake old browser
-        r'mozilla/5\.0$',  # Incomplete mozilla string
+        # Note: exact "Mozilla/5.0" is common; avoid flagging it as suspicious.
     ]
     
     # Known legitimate bot user agents to whitelist
@@ -1265,9 +1439,22 @@ class HeaderValidationMiddleware(MiddlewareMixin):
         
         # Get headers from request.META
         headers = request.META
+
+        cap_reason = self._enforce_header_caps(headers)
+        if cap_reason:
+            return self._block_request(request, ip, cap_reason, request.path)
+
+        required_headers = self._get_required_headers(request)
+
+        if self._should_use_rust():
+            min_score = self._get_min_quality_score(required_headers)
+            reason = rust_validate_headers(headers, required_headers, min_score)
+            if reason:
+                return self._block_request(request, ip, reason, request.path)
+            return None
         
         # Check for missing required headers
-        missing_headers = self._check_missing_headers(headers)
+        missing_headers = self._check_missing_headers(headers, required_headers)
         if missing_headers:
             return self._block_request(request, ip, f"Missing required headers: {', '.join(missing_headers)}", request.path)
         
@@ -1277,16 +1464,23 @@ class HeaderValidationMiddleware(MiddlewareMixin):
             return self._block_request(request, ip, f"Suspicious user agent: {suspicious_ua}", request.path)
         
         # Check for suspicious header combinations
-        suspicious_combo = self._check_header_combinations(headers)
+        suspicious_combo = self._check_header_combinations(headers, required_headers)
         if suspicious_combo:
             return self._block_request(request, ip, f"Suspicious headers: {suspicious_combo}", request.path)
         
         # Check header quality score
         quality_score = self._calculate_header_quality(headers)
-        if quality_score < 3:  # Threshold for suspicion
+        min_score = self._get_min_quality_score(required_headers)
+        if min_score and quality_score < min_score:  # Threshold for suspicion
             return self._block_request(request, ip, f"Low header quality score: {quality_score}", request.path)
         
         return None
+
+    def _should_use_rust(self) -> bool:
+        return (
+            getattr(settings, "AIWAF_USE_RUST", False)
+            and rust_available()
+        )
     
     def _is_static_request(self, request):
         """Check if this is a request for static files"""
@@ -1304,11 +1498,33 @@ class HeaderValidationMiddleware(MiddlewareMixin):
             
         return False
     
-    def _check_missing_headers(self, headers):
+    def _get_required_headers(self, request):
+        override = getattr(settings, "AIWAF_REQUIRED_HEADERS", None)
+        if override is None:
+            return list(self.REQUIRED_HEADERS)
+        if isinstance(override, (list, tuple)):
+            return list(override)
+        if isinstance(override, dict):
+            method = getattr(request, "method", "").upper()
+            headers = override.get(method)
+            if headers is None:
+                headers = override.get("DEFAULT")
+            if headers is None:
+                return list(self.REQUIRED_HEADERS)
+            return list(headers)
+        return list(self.REQUIRED_HEADERS)
+
+    def _get_min_quality_score(self, required_headers):
+        default_min = getattr(settings, "AIWAF_HEADER_QUALITY_MIN_SCORE", 3)
+        if not required_headers:
+            return 0
+        return default_min
+
+    def _check_missing_headers(self, headers, required_headers):
         """Check for missing required headers"""
         missing = []
         
-        for header in self.REQUIRED_HEADERS:
+        for header in required_headers:
             if not headers.get(header):
                 missing.append(header.replace('HTTP_', '').replace('_', '-').lower())
                 
@@ -1319,6 +1535,9 @@ class HeaderValidationMiddleware(MiddlewareMixin):
         if not user_agent:
             return "Empty user agent"
             
+        if len(user_agent) > self.MAX_USER_AGENT_LENGTH:
+            return f"User-Agent longer than {self.MAX_USER_AGENT_LENGTH} chars"
+        
         user_agent_lower = user_agent.lower()
         
         # Check if it's a legitimate bot first
@@ -1336,15 +1555,52 @@ class HeaderValidationMiddleware(MiddlewareMixin):
             return "Too short"
             
         # Check for very long user agents (possibly malicious)
-        if len(user_agent) > 500:
-            return "Too long"
+        if len(user_agent) > self.MAX_USER_AGENT_LENGTH:
+            return f"Too long (> {self.MAX_USER_AGENT_LENGTH})"
             
         return None
+
+    def _enforce_header_caps(self, headers):
+        """Fail fast for oversized header floods and malformed clients."""
+        total_bytes = 0
+        header_count = 0
+
+        for key, value in headers.items():
+            if not self._is_http_meta_key(key):
+                continue
+
+            header_count += 1
+            value_str = value if isinstance(value, str) else str(value)
+            total_bytes += len(key) + len(value_str)
+
+            if total_bytes > self.MAX_HEADER_BYTES:
+                return f"Header bytes exceed {self.MAX_HEADER_BYTES}"
+
+        if header_count > self.MAX_HEADER_COUNT:
+            return f"Header count exceeds {self.MAX_HEADER_COUNT}"
+
+        user_agent = headers.get('HTTP_USER_AGENT', '')
+        if user_agent and len(user_agent) > self.MAX_USER_AGENT_LENGTH:
+            return f"User-Agent longer than {self.MAX_USER_AGENT_LENGTH} chars"
+
+        accept_header = headers.get('HTTP_ACCEPT', '')
+        if accept_header and len(accept_header) > self.MAX_ACCEPT_LENGTH:
+            return f"Accept header longer than {self.MAX_ACCEPT_LENGTH} chars"
+
+        return None
+
+    def _is_http_meta_key(self, key: str) -> bool:
+        return key.startswith('HTTP_') or key in {'CONTENT_TYPE', 'CONTENT_LENGTH'}
     
-    def _check_header_combinations(self, headers):
+    def _check_header_combinations(self, headers, required_headers):
         """Check for suspicious header combinations"""
+        if not required_headers:
+            return None
+        required = set(required_headers)
         for combo in self.SUSPICIOUS_COMBINATIONS:
             try:
+                if combo.get('reason') == 'User-Agent present but no Accept header' and 'HTTP_ACCEPT' not in required:
+                    continue
                 if combo['condition'](headers):
                     return combo['reason']
             except Exception:
@@ -1386,7 +1642,11 @@ class HeaderValidationMiddleware(MiddlewareMixin):
         """Block the request and raise PermissionDenied"""
         # Double-check exemption before blocking
         if not is_ip_exempted(ip):
-            BlacklistManager.block(ip, f"Header validation: {reason}")
+            BlacklistManager.block(
+                ip,
+                f"Header validation: {reason}",
+                extended_request_info=_get_blacklist_extended_info(request),
+            )
             
             # Check if actually blocked (exempted IPs won't be blocked)
             if BlacklistManager.is_blocked(ip):
