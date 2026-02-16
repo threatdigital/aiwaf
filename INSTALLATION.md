@@ -259,9 +259,14 @@ backend (pyo3/maturin) for header validation. If the Rust module is not
 available, it falls back to Python automatically.
 
 ```bash
-pip install maturin
-maturin develop -m Cargo.toml
+pip install aiwaf
 ```
+
+```bash
+pip install "aiwaf[rust]"
+```
+
+This pulls the separately-released Rust extension package (`aiwaf-rust`).
 
 ```python
 AIWAF_MIDDLEWARE_CSV = True
