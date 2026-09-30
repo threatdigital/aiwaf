@@ -4,8 +4,10 @@ Django Unit Tests for AIWAF Trainer Module
 Tests the trainer module functions using Django test framework.
 """
 
-from datetime import datetime
-from unittest.mock import patch
+from datetime import datetime, timedelta
+from unittest.mock import MagicMock, patch
+
+import numpy as np
 
 from django.test import override_settings
 
@@ -147,3 +149,80 @@ class TrainerFunctionsTestCase(AIWAFTestCase):
             "total_404": 3,
         }]
         self.assertEqual(result, expected)
+
+    def test_burst_count_is_trailing_ten_second_window(self):
+        """burst_count covers the 10 seconds up to and including a request"""
+        t0 = datetime(2025, 1, 1, 0, 0, 0)
+        times = [t0, t0 + timedelta(seconds=5), t0 + timedelta(seconds=10),
+                 t0 + timedelta(seconds=11), t0 + timedelta(seconds=100)]
+
+        burst = self.trainer_module._burst_count
+        self.assertEqual(burst(times, t0), 1)
+        self.assertEqual(burst(times, t0 + timedelta(seconds=5)), 2)
+        # the window's edges are inclusive
+        self.assertEqual(burst(times, t0 + timedelta(seconds=10)), 3)
+        self.assertEqual(burst(times, t0 + timedelta(seconds=11)), 3)
+        # later requests from the same IP never count
+        self.assertEqual(burst(times, t0 + timedelta(seconds=100)), 1)
+
+    def test_generate_feature_dicts_burst_matches_rust(self):
+        """Python fallback agrees with the Rust extractor's burst counts"""
+        t0 = datetime(2025, 1, 1, 0, 0, 0)
+        parsed = [
+            {"ip": "2.2.2.2", "timestamp": t0 + timedelta(seconds=s),
+             "path": "/legit", "status": "200", "response_time": 0.1}
+            for s in (0, 5, 100)
+        ]
+        # deliberately unsorted, as with rotated log files
+        ip_times = {"2.2.2.2": [rec["timestamp"] for rec in reversed(parsed)]}
+
+        with patch('aiwaf.trainer.path_exists_in_django', return_value=True):
+            result = self.trainer_module._generate_feature_dicts(parsed, {}, ip_times)
+
+        self.assertEqual([f["burst_count"] for f in result], [1, 2, 1])
+
+    def test_train_features_and_anomaly_blocking(self):
+        """train() computes trailing bursts from unordered logs and blocks
+        only anomalous IPs with suspicious behaviour"""
+        t0 = datetime(2025, 1, 1, 0, 0, 0)
+
+        def line(ip, ts, path, status):
+            return (f'{ip} - - [{ts.strftime("%d/%b/%Y:%H:%M:%S")} +0000] '
+                    f'"GET {path} HTTP/1.1" {status} 0 "-" "test-agent" '
+                    f'response-time=0.1\n')
+
+        benign = "10.0.0.1"
+        scanner = "10.0.0.2"
+        # the benign IP's latest request comes first, as with rotated logs
+        lines = [
+            line(benign, t0 + timedelta(seconds=100), "/", 200),
+            line(benign, t0, "/", 200),
+            line(benign, t0 + timedelta(seconds=5), "/", 200),
+        ] + [
+            line(scanner, t0 + timedelta(seconds=s), f"/wp-{s}.php", 404)
+            for s in range(12)
+        ]
+
+        model = MagicMock()
+        model.predict.side_effect = lambda X: np.full(len(X), -1)
+
+        with patch('aiwaf.trainer._iter_all_logs', side_effect=lambda: iter(lines)), \
+             patch('aiwaf.trainer.MIN_TRAIN_LOGS', 1), \
+             patch('aiwaf.trainer.path_exists_in_django', return_value=False) as mock_exists, \
+             patch('aiwaf.trainer.IsolationForest', return_value=model), \
+             patch('aiwaf.trainer.save_model_data', return_value=True), \
+             patch('aiwaf.trainer.BlacklistManager.block') as mock_block:
+            self.trainer_module.train(force_ai=True)
+
+        X = model.fit.call_args[0][0]
+        burst_col = 4  # path_len, kw_hits, resp_time, status_idx, burst_count, total_404
+        self.assertEqual(list(X[:3, burst_col]), [1, 1, 2])
+
+        # each distinct path is resolved once in the feature pass
+        resolved = [c.args[0] for c in mock_exists.call_args_list]
+        self.assertEqual(resolved.count("/"), 1)
+
+        ai_blocks = [c.args for c in mock_block.call_args_list
+                     if c.args[1].startswith("AI anomaly")]
+        self.assertEqual([ip for ip, _ in ai_blocks], [scanner])
+        self.assertIn("404s:12,", ai_blocks[0][1])

@@ -3,6 +3,7 @@ import glob
 import gzip
 import csv
 import re
+from bisect import bisect_left, bisect_right
 from itertools import chain
 try:
     import joblib
@@ -10,7 +11,7 @@ try:
 except ImportError:
     joblib = None
     JOBLIB_AVAILABLE = False
-from datetime import datetime
+from datetime import datetime, timedelta
 from collections import defaultdict, Counter
 import logging
 try:
@@ -55,6 +56,8 @@ MODEL_PATH = os.path.join(os.path.dirname(__file__), "resources", "model.pkl")
 MIN_AI_LOGS = getattr(settings, "AIWAF_MIN_AI_LOGS", 10000)
 MIN_TRAIN_LOGS = getattr(settings, "AIWAF_MIN_TRAIN_LOGS", 50)
 
+BURST_WINDOW = timedelta(seconds=10)
+
 STATIC_KW  = [".php", "xmlrpc", "wp-", ".env", ".git", ".bak", "conflg", "shell", "filemanager"]
 STATUS_IDX = ["200", "403", "404", "500"]
 
@@ -97,6 +100,18 @@ def path_exists_in_django(path: str) -> bool:
     # Only do basic prefix matching for known include patterns
     # but don't assume sub-paths exist just because the prefix exists
     return False
+
+
+def _burst_count(sorted_times, ts) -> int:
+    """Count requests in sorted_times within BURST_WINDOW up to and including ts.
+
+    Matches the middleware (and the Rust extractor), which count an IP's
+    requests in the last 10 seconds.  Bisecting keeps training at
+    O(n log n) instead of scanning every request from the IP per request.
+    """
+    lo = bisect_left(sorted_times, ts - BURST_WINDOW)
+    hi = bisect_right(sorted_times, ts)
+    return hi - lo
 
 
 def remove_exempt_keywords() -> None:
@@ -464,6 +479,10 @@ def _generate_feature_dicts(parsed, ip_404, ip_times):
         if rust_features is not None:
             return rust_features
 
+    sorted_times = defaultdict(list)
+    for ip, times in ip_times.items():
+        sorted_times[ip] = sorted(times)
+
     feature_dicts = []
     for rec in records:
         kw_hits = 0
@@ -471,11 +490,7 @@ def _generate_feature_dicts(parsed, ip_404, ip_times):
             path_lower = rec["path_lower"]
             kw_hits = sum(1 for kw in STATIC_KW if kw in path_lower)
 
-        burst = 0
-        timestamps = ip_times.get(rec["ip"], [])
-        for ts in timestamps:
-            if (rec["timestamp"] - ts).total_seconds() <= 10:
-                burst += 1
+        burst = _burst_count(sorted_times[rec["ip"]], rec["timestamp"])
 
         feature_dicts.append({
             "ip": rec["ip"],
@@ -508,13 +523,18 @@ def _parse(line: str) -> dict | None:
     }
 
 
-def _is_malicious_context_trainer(path: str, keyword: str, status: str = "404") -> bool:
+def _is_malicious_context_trainer(path: str, keyword: str, status: str = "404", known_path: bool | None = None) -> bool:
     """
     Determine if a keyword from log analysis appears in a malicious context.
     This is the trainer version of the middleware's _is_malicious_context method.
+
+    Pass known_path when the caller has already resolved the path, to skip
+    another round of URL resolution.
     """
     # Don't learn from valid Django paths
-    if path_exists_in_django(path):
+    if known_path is None:
+        known_path = path_exists_in_django(path)
+    if known_path:
         return False
     
     # Strong malicious indicators for log analysis
@@ -645,6 +665,23 @@ def train(disable_ai=False, force_ai=False) -> None:
         logger.info("No log lines found – check AIWAF_ACCESS_LOG setting.")
         return
 
+    # Rotated log files aren't read in chronological order; _burst_count
+    # needs each IP's timestamps sorted.
+    for times in ip_times.values():
+        times.sort()
+
+    # URL resolution is the costliest per-row step and paths repeat heavily,
+    # so resolve each distinct path once per run.  Kept local to the run:
+    # the URLconf can change between runs, and the middleware shares
+    # path_exists_in_django.
+    known_path_cache = {}
+
+    def _known(path):
+        known = known_path_cache.get(path)
+        if known is None:
+            known = known_path_cache[path] = path_exists_in_django(path)
+        return known
+
     if parsed_count < MIN_TRAIN_LOGS:
         logger.info(f"Not enough log lines ({parsed_count}) for training. Need at least {MIN_TRAIN_LOGS}.")
         return
@@ -681,7 +718,7 @@ def train(disable_ai=False, force_ai=False) -> None:
             continue
 
         path = rec["path"]
-        known_path = path_exists_in_django(path)
+        known_path = _known(path)
         kw_check = (not known_path) and (not is_exempt_path(path))
         status_idx = STATUS_IDX.index(rec["status"]) if rec["status"] in STATUS_IDX else -1
         if use_rust_features:
@@ -710,11 +747,7 @@ def train(disable_ai=False, force_ai=False) -> None:
             if kw_check:
                 kw_hits = sum(1 for kw in STATIC_KW if kw in path_lower)
 
-            burst = 0
-            timestamps = ip_times.get(rec["ip"], [])
-            for ts in timestamps:
-                if (rec["timestamp"] - ts).total_seconds() <= 10:
-                    burst += 1
+            burst = _burst_count(ip_times[rec["ip"]], rec["timestamp"])
 
             feature_dicts.append({
                 "ip": rec["ip"],
@@ -732,7 +765,7 @@ def train(disable_ai=False, force_ai=False) -> None:
                 if (len(seg) > 3 and
                     seg not in STATIC_KW and
                     seg not in legitimate_keywords and
-                    _is_malicious_context_trainer(path, seg, rec["status"])):
+                    _is_malicious_context_trainer(path, seg, rec["status"], known_path=known_path)):
                     tokens[seg] += 1
                     if len(token_example_paths[seg]) < 5:
                         token_example_paths[seg].append(path)
@@ -824,20 +857,27 @@ def train(disable_ai=False, force_ai=False) -> None:
                 
                 exemption_store = get_exemption_store()
                 blacklist_store = get_blacklist_store()
-                
+
+                # Summarise every anomalous IP's traffic in one pass rather
+                # than filtering the whole frame once per IP.
+                ip_stats = df[df["ip"].isin(anomalous_ips)].groupby("ip").agg(
+                    avg_kw_hits=("kw_hits", "mean"),
+                    max_404s=("total_404", "max"),
+                    avg_burst=("burst_count", "mean"),
+                    total_requests=("kw_hits", "size"),
+                )
+
                 for ip in anomalous_ips:
                     # Skip if IP is exempted
                     if exemption_store.is_exempted(ip):
                         continue
                     
-                    # Get this IP's behavior from the data
-                    ip_data = df[df["ip"] == ip]
-                    
                     # Criteria to determine if this is likely a legitimate user vs threat:
-                    avg_kw_hits = ip_data["kw_hits"].mean()
-                    max_404s = ip_data["total_404"].max()
-                    avg_burst = ip_data["burst_count"].mean()
-                    total_requests = len(ip_data)
+                    stats = ip_stats.loc[ip]
+                    avg_kw_hits = stats["avg_kw_hits"]
+                    max_404s = int(stats["max_404s"])
+                    avg_burst = stats["avg_burst"]
+                    total_requests = int(stats["total_requests"])
                     
                     # Treat pure-burst traffic with no 404s/keywords as legitimate (e.g., polling)
                     if max_404s == 0 and avg_kw_hits == 0:
