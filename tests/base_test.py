@@ -29,6 +29,9 @@ class AIWAFTestCase(TestCase):
         from django.core.cache import cache
         cache.clear()
         
+        from aiwaf.storage import clear_exemption_cache
+        clear_exemption_cache()
+
         # Reset any global AIWAF state
         try:
             from aiwaf.storage import Storage

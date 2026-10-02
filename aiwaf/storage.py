@@ -12,6 +12,8 @@ from django.utils import timezone
 import os
 import json
 import logging
+import threading
+import time
 from collections import defaultdict
 
 # Defer model imports to avoid AppRegistryNotReady during Django app loading
@@ -209,6 +211,63 @@ class ModelBlacklistStore:
             logger.error("Error clearing all blacklist entries: %s", e, exc_info=True)
             return 0
 
+# Per-process cache of the exempt IPs and paths.  Nearly every middleware
+# checks both on every request, and they almost never change, so each
+# process keeps a snapshot and reloads it after AIWAF_EXEMPTION_CACHE_TTL
+# seconds (0 turns the cache off).  Saves and deletes clear it in the
+# process that made them (see AiwafConfig.ready); other processes catch up
+# within the TTL.  Deliberately not Django's cache framework: with Redis
+# that would still be a network round trip per check.
+_DEFAULT_EXEMPTION_CACHE_TTL = 60
+_exemption_cache = {}
+_exemption_cache_generation = 0
+_exemption_cache_lock = threading.Lock()
+
+
+def _cached_exemptions(key, loader):
+    """Return loader()'s result for key, reloading once the TTL has passed."""
+    ttl = getattr(settings, "AIWAF_EXEMPTION_CACHE_TTL", _DEFAULT_EXEMPTION_CACHE_TTL)
+    if not ttl or ttl <= 0:
+        return loader()
+    entry = _exemption_cache.get(key)
+    now = time.monotonic()
+    if entry is not None and entry[0] > now:
+        return entry[1]
+    generation = _exemption_cache_generation
+    value = loader()
+    with _exemption_cache_lock:
+        # a clear while we were loading means our value may predate it
+        if generation == _exemption_cache_generation:
+            _exemption_cache[key] = (now + ttl, value)
+    return value
+
+
+def clear_exemption_cache():
+    """Forget the cached exempt IPs and paths in this process."""
+    global _exemption_cache_generation
+    with _exemption_cache_lock:
+        _exemption_cache_generation += 1
+        _exemption_cache.clear()
+
+
+def exemption_changed(sender, **kwargs):
+    """post_save / post_delete receiver for IPExemption and ExemptPath."""
+    from django.db import transaction
+
+    clear_exemption_cache()
+    # clear again at commit: a reload by another thread before then would
+    # have read the old rows
+    transaction.on_commit(clear_exemption_cache, using=kwargs.get("using"))
+
+
+def _load_exempt_ips():
+    return frozenset(IPExemption.objects.values_list("ip_address", flat=True))
+
+
+def _load_exempt_paths():
+    return tuple(ExemptPath.objects.filter(enabled=True).values_list("path", flat=True))
+
+
 class ModelExemptionStore:
     @staticmethod
     def is_exempted(ip):
@@ -217,8 +276,11 @@ class ModelExemptionStore:
         if IPExemption is None:
             return False
         try:
-            return IPExemption.objects.filter(ip_address=ip).exists()
-        except Exception:
+            # normalize the way filter(ip_address=ip) would (IPv6 forms)
+            ip = IPExemption._meta.get_field("ip_address").get_prep_value(ip)
+            return ip in _cached_exemptions("ips", _load_exempt_ips)
+        except Exception as e:
+            logger.warning("Error checking exemption for IP %s: %s", ip, e, exc_info=True)
             return False
 
     @staticmethod
@@ -338,10 +400,9 @@ class ModelPathExemptionStore:
         if ExemptPath is None:
             return []
         try:
-            return list(
-                ExemptPath.objects.filter(enabled=True).values_list("path", flat=True)
-            )
-        except Exception:
+            return list(_cached_exemptions("paths", _load_exempt_paths))
+        except Exception as e:
+            logger.warning("Error loading exempt paths: %s", e, exc_info=True)
             return []
 
     @staticmethod

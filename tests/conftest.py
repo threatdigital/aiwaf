@@ -70,3 +70,14 @@ def pytest_runtest_setup(item):
         raise RuntimeError(
             "aiwaf-rust package (module aiwaf_rust) is required for requires_rust tests"
         )
+
+
+@pytest.fixture(autouse=True)
+def _clear_exemption_cache():
+    """A rolled-back test transaction sends no post_delete, so start clean."""
+    from django.apps import apps
+
+    if apps.ready:
+        from aiwaf.storage import clear_exemption_cache
+
+        clear_exemption_cache()
